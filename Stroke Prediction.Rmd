@@ -1,0 +1,380 @@
+---
+output: 
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+- \usepackage[fontsize=12pt]{scrextend}
+editor_options: 
+  markdown: 
+    wrap: 72
+mainfont: "Times New Roman"
+---
+\setcounter{page}{14}
+
+# *7.0 Appendix*
+```{r setup, results = 'hide', warning=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+stroke = read_csv("/Users/yunkyaw/Documents/GitHub/SS-9155/healthcare-dataset-stroke-data.csv")
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(corrplot)
+library(caret) # confusion matrix
+library(performanceEstimation) # SMOTE
+library(car) # VIF
+library(doParallel) # parallel computing
+library(glmnet) # logistic regression
+library(randomForest)
+library(ResourceSelection) # hoslem.test
+library(pROC)
+library(xgboost)
+```
+
+# *7.1 EDA*
+
+## Data Cleaning
+
+```{r, message = FALSE, warning = FALSE}
+# gender, hypertension, heart_disease, ever_married, work_type, Residence_type,
+# smoking_status, target should all be categorical
+stroke$gender = as.factor(stroke$gender)
+stroke$hypertension = as.factor(stroke$hypertension)
+stroke$heart_disease = as.factor(stroke$heart_disease)
+stroke$ever_married = as.factor(stroke$ever_married)
+stroke$work_type = as.factor(stroke$work_type)
+stroke$Residence_type = as.factor(stroke$Residence_type)
+stroke$smoking_status = as.factor(stroke$smoking_status)
+# renaming response variable to targetto remove confusion
+stroke$target = as.factor(stroke$stroke) 
+
+# bmi should be numeric
+stroke$bmi = as.numeric(stroke$bmi)
+
+# removing id and stroke variables
+stroke = stroke[, -c(1, 12)]
+
+str(stroke)
+
+# determining if there are any missing values and where
+colSums(is.na(stroke))
+
+# factor columns
+factor_cols = sapply(stroke, is.factor)
+
+# numeric columns
+num_cols = sapply(stroke, is.numeric)
+```
+
+## Looking at Distribution of Numeric Variables
+```{r, message=FALSE, warning=FALSE}
+# convert stroke to long column dataset
+melt.stroke = melt(stroke[num_cols])
+
+# boxplot of numeric variables
+ggplot(data = melt.stroke, aes(x = variable, y = value)) + 
+  geom_boxplot() +
+  labs(title = "Boxplots of Numeric Variables", x = "Variable", y = "Value")
+
+# distribution of numeric variables
+ggplot(data = melt.stroke, aes(x = value)) +
+  stat_density(aes(y = ..scaled..)) + 
+  facet_wrap(~variable, scales = "free")
+```
+
+## Looking at Distribution of Categorical Variables
+```{r, warning = FALSE}
+# convert to long column dataset
+stroke_fact = stroke[factor_cols] %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Category")
+
+# plotting proportion
+ggplot(stroke_fact, aes(x = Category, fill = Category)) +
+  geom_bar(aes(y = after_stat(prop), group = 1)) +
+  facet_wrap(~ Variable, scales = "free") +
+  labs(title = "Distribution of Categorical Variables", y = "Proportion") +
+  theme(legend.position = "none") +
+  scale_x_discrete(guide = guide_axis(angle = 45))
+
+```
+
+## Imputing BMI (Missing Values)
+```{r}
+# impute missing values with the median value
+stroke$bmi[is.na(stroke$bmi)] = median(stroke$bmi, na.rm = TRUE)
+summary(stroke$bmi)
+```
+
+## Correlation Analysis
+```{r}
+res = cor(stroke[num_cols])
+corrplot(res, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+## VIF - Looking for Multicollinearity
+```{r}
+# logistic regression for VIF
+log_model = glm(target ~ ., family = "binomial", data = stroke)
+# VIF analysis
+vif_values = vif(log_model)
+vif_values
+```
+
+## SMOTE for Class Imbalance
+```{r}
+set.seed(123)
+
+# generating smote data
+stroke_smote = smote(target ~., stroke)
+
+table(stroke_smote$target)
+```
+
+# *7.2 Data Analysis*
+## Test-Train Partition
+```{r}
+# 70% of data for training
+smp_size = floor(0.7*nrow(stroke_smote))
+
+set.seed(123)
+# selecting which rows are for training
+train_ind = sample(seq_len(nrow(stroke_smote)), size = smp_size)
+train = stroke_smote[train_ind, ]  # training set
+test = stroke_smote[-train_ind, ]  # testing set
+```
+
+## Logistic Regression
+### Preprocessing
+```{r}
+# one hot encoding data - for logistic regression and xgb
+one_train = model.matrix(~ . - 1, data = train)
+
+one_test = model.matrix(~ . - 1, data = test)
+
+# scaling avg_glucose_level and BMI - for logistic regression
+log_train = as.data.frame(one_train)
+log_train$avg_glucose_level = scale(log_train$avg_glucose_level)
+log_train$bmi = scale(log_train$bmi)
+
+log_test = as.data.frame(one_test)
+log_test$avg_glucose_level = scale(log_test$avg_glucose_level)
+log_test$bmi = scale(log_test$bmi)
+```
+
+```{r}
+registerDoParallel(cores = 8) # parallel computing 
+
+# find best lambda to apply a penalty to the features
+set.seed(123)
+cvfit = cv.glmnet(as.matrix(log_train[, -18]), as.matrix(log_train[, 18]),
+                  nfolds = 10, alpha = 1, family = "binomial", parallel = TRUE)
+
+# final model - logistic regression with lasso penalty
+# selecting the lambda that produces the minimum MSE
+log_fit = glmnet(as.matrix(log_train[, -18]), as.matrix(log_train[, 18]),
+                 alpha = 1, family = "binomial", lambda = cvfit$lambda.min)
+
+stopImplicitCluster() # stop parallel computing
+
+# coefficients
+round(coef(log_fit), 3)
+
+# for log-odds calculation
+# exp(coef(log_fit))
+```
+
+### Goodness of Fit
+```{r}
+# producing probability of each row belonging to a class
+log_prob = predict(log_fit, newx = as.matrix(log_test[, -18]), type = "response")
+
+hoslem.test(as.numeric(log_test[, 18]), log_prob, g = 10)
+# good fit as p > 0.05
+```
+
+### Generating Predictions and Confusion Matrix
+```{r}
+# predicting the class of each row with a 0.50 threshold
+log_pred = ifelse(log_prob > 0.5, 1, 0)
+
+# confusion matrix
+confusionMatrix(as.factor(log_pred), as.factor(log_test[, 18]))
+```
+
+### ROC Analysis
+```{r, warning = FALSE, message = FALSE}
+# developing and plotting ROC curve
+roc_obj = roc(response = test$target, predictor = log_prob)
+
+# calculating area under the curve
+AUC = auc(roc_obj)
+
+# getting threshold, sensitivity, accuracy, and AUC for current model
+roc_log = c(coords(roc_obj, "b", ret = c("threshold", "se", "sp", "accuracy"), 
+                   best.method = "youden"), AUC)
+
+names(roc_log) = c("Threshold", "Sensitivity", "Specificity", "Accuracy", "AUC")
+
+t(roc_log)
+```
+
+### Changing Threshold
+```{r}
+log_pred_adj = ifelse(log_prob > 0.3990413, 1, 0)
+
+# confusion matrix
+confusionMatrix(as.factor(log_pred_adj), as.factor(log_test[, 18]))
+```
+
+## Random Forest
+```{r}
+registerDoParallel(cores = 8) # parallel computing 
+
+set.seed(123)
+
+# control function for grid search, setting 10-fold cv repeated 3 times
+control = trainControl(method = "repeatedcv", number = 10, repeats = 3,
+                       search = "grid")
+
+# defining the grid parameters - mtry (number of splits per tree)
+grid = expand.grid(mtry = c(1:10))
+
+# training the random forest model with 10-fold cross validation and 1000 trees
+rf_gridsearch = train(target~., data=train, method="rf", tuneGrid = grid,
+                      trControl = control)
+
+plot(rf_gridsearch)
+# determine optimal mtry = 5
+
+# optimal random forest 
+rf_gridsearch
+```
+
+### Generating Optimal Model
+```{r}
+rfModel = randomForest(target ~ ., data = train, proximity = T, ntree = 1000,
+                       mtry = 5) 
+stopImplicitCluster() # stop parallel computing
+rfModel
+```
+
+### Visualize Important Features
+```{r}
+varImpPlot(rfModel)
+```
+
+### Generating Predictions and Confusion Matrix
+```{r}
+# probabilistic predictions
+rf_prob = predict(rfModel, newdata = test[, -11], type = "prob")
+
+# class predictions
+rf_pred = predict(rfModel, newdata = test[, -11], type = "response")
+
+confusionMatrix(rf_pred, test$target)
+```
+
+## XGBoost
+### Preprocessing 
+```{r}
+# use one-hot encoded variables, creating DMatrix data structure for xgb
+# data = independent variables, label = dependent variable
+xgb_train = xgb.DMatrix(data = as.matrix(one_train[, 1:17]),
+                        label = as.numeric(one_train[, 18]))
+xgb_test = xgb.DMatrix(data = as.matrix(one_test[, 1:17]),
+                       label = as.numeric(one_test[, 18]))
+
+# set parameters
+params = list(
+  booster = "gbtree",            # decision tree
+  eta = 0.1,                     # learning rate
+  max_depth = 5,                 # maximum tree depth
+  objective = "multi:softprob",  # generate probabilities for classes
+  nthread = 10,                  # nos of CPU for model use
+  num_class = 2                  # nos of classes of target
+)
+```
+
+### Cross-Validation to Find Optimal Model
+```{r, result = FALSE, message = FALSE}
+# utilizing cross-validation to determine the optimal number of rounds
+set.seed(123)
+cv_xgb = xgb.cv(params = params, data = xgb_train, nrounds=2000, nfold = 10,
+                verbose = 0, early_stopping_rounds = 10)
+
+# find optimal nrounds = 110
+# train-mlogloss:0.173914+0.004857	test-mlogloss:0.405670+0.034391
+```
+
+### Generating Optimal Model 
+```{r, result = 'hide'}
+set.seed(123)
+xgb_model = xgboost(params = params, data = xgb_train, nrounds = 110, verbose = 0)
+# train-mlogloss:0.180190 
+```
+
+### Generating Predictions and Confusion Matrix
+```{r}
+# probabilistic predictions
+xgb_prob = predict(xgb_model, xgb_test, reshape = TRUE)
+
+colnames(xgb_prob) = levels(train$target)
+
+# generate class predictions for probability of being positive
+xgb_pred = ifelse(xgb_prob[, 2] > 0.5, 1, 0)
+
+confusionMatrix(as.factor(xgb_pred), test$target)
+```
+
+### Important Features
+```{r}
+xgb_feat = xgb.importance(feature_names = colnames(xgb_train), model = xgb_model)
+xgb.plot.importance(xgb_feat)
+```
+
+# *7.3 Comparison*
+## ROC Curves
+```{r, warning = FALSE, message=FALSE}
+# logistic regression
+roc_log = roc(response = test$target, predictor = log_prob)
+# AUC = 0.8357
+
+# random forest - looking at the probability of a positive observation
+roc_rf = roc(response = test$target, predictor = rf_prob[, "1"])
+# AUC = 0.8997
+
+# xgboost - looking at the probability of a positive observation
+roc_xgb = roc(response = test$target, predictor = xgb_prob[, 2])
+# AUC = 0.8791
+
+# plotting
+plot(roc_log, legacy.axes = FALSE, cex.lab = 2, col = "green")
+lines(roc_log, col = "green")
+lines(roc_rf, col = "red")
+lines(roc_xgb, col = "blue")
+legend("bottomright", legend = c("Logistic Regression (AUC = 0.8357)",
+                                 "Random Forest (AUC = 0.8997)",
+                                 "XGBoost (AUC = 0.8791)"), 
+       col = c("green", "red", "blue"), lty = 1)
+```
+
+## Table of Metrics
+```{r}
+# retrieved metric values from confusionMatrix for each model
+metrics = c("Accuracy", "Sensitivity", "Specificity", "AUC")
+log_metr = c(0.7667, 0.7, 0.8565, 0.8357)
+rf_metr = c(0.826, 0.81, 0.8475, 0.8997)
+xgb_metr = c(0.782, 0.77, 0.7982, 0.8791)
+
+results_table = data.frame(
+  Metric = metrics,
+  Logistic_Regression = log_metr,
+  Random_Forest = rf_metr,
+  XGBoost = xgb_metr
+)
+
+t(results_table)
+```
